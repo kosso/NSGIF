@@ -1,6 +1,6 @@
 //
 //  NSGIF.m
-//  
+//
 //  Created by Sebastian Dobrincu
 //
 
@@ -24,7 +24,7 @@ typedef NS_ENUM(NSInteger, GIFSize) {
 #pragma mark - Public methods
 
 + (void)optimalGIFfromURL:(NSURL*)videoURL loopCount:(int)loopCount completion:(void(^)(NSURL *GifURL))completionBlock {
-
+    
     int delayTime = 0.2;
     
     // Create properties dictionaries
@@ -75,10 +75,9 @@ typedef NS_ENUM(NSInteger, GIFSize) {
     });
     
     dispatch_group_notify(gifQueue, dispatch_get_main_queue(), ^{
-        // Return GIF URL
         completionBlock(gifURL);
     });
-
+    
 }
 
 + (void)createGIFfromURL:(NSURL*)videoURL withFrameCount:(int)frameCount delayTime:(int)delayTime loopCount:(int)loopCount completion:(void(^)(NSURL *GifURL))completionBlock {
@@ -93,7 +92,20 @@ typedef NS_ENUM(NSInteger, GIFSize) {
     NSDictionary *frameProperties = [self framePropertiesWithDelayTime:delayTime];
     
     AVURLAsset *asset = [AVURLAsset assetWithURL:videoURL];
-
+    
+    float videoWidth = [[[asset tracksWithMediaType:AVMediaTypeVideo] objectAtIndex:0] naturalSize].width;
+    float videoHeight = [[[asset tracksWithMediaType:AVMediaTypeVideo] objectAtIndex:0] naturalSize].height;
+    
+    GIFSize optimalSize = GIFSizeMedium;
+    if (videoWidth >= 1200 || videoHeight >= 1200)
+        optimalSize = GIFSizeVeryLow;
+    else if (videoWidth >= 800 || videoHeight >= 800)
+        optimalSize = GIFSizeLow;
+    else if (videoWidth >= 400 || videoHeight >= 400)
+        optimalSize = GIFSizeMedium;
+    else if (videoWidth < 400|| videoHeight < 400)
+        optimalSize = GIFSizeHigh;
+    
     // Get the length of the video in seconds
     float videoLength = (float)asset.duration.value/asset.duration.timescale;
     
@@ -107,22 +119,24 @@ typedef NS_ENUM(NSInteger, GIFSize) {
         CMTime time = CMTimeMakeWithSeconds(seconds, [timeInterval intValue]);
         [timePoints addObject:[NSValue valueWithCMTime:time]];
     }
-
+    
     // Prepare group for firing completion block
     dispatch_group_t gifQueue = dispatch_group_create();
     dispatch_group_enter(gifQueue);
     
-    __block NSURL *gifURL;
+    __block NSURL *gifURL = nil;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         
-        gifURL = [self createGIFforTimePoints:timePoints fromURL:videoURL fileProperties:fileProperties frameProperties:frameProperties frameCount:frameCount gifSize:GIFSizeMedium];
-
+        gifURL = [self createGIFforTimePoints:timePoints fromURL:videoURL fileProperties:fileProperties frameProperties:frameProperties frameCount:frameCount gifSize:optimalSize];
+        
         dispatch_group_leave(gifQueue);
     });
     
     dispatch_group_notify(gifQueue, dispatch_get_main_queue(), ^{
-        // Return GIF URL
-        completionBlock(gifURL);
+        
+        if(gifURL){
+            completionBlock(gifURL);
+        }
     });
     
 }
@@ -131,13 +145,18 @@ typedef NS_ENUM(NSInteger, GIFSize) {
 
 + (NSURL *)createGIFforTimePoints:(NSArray *)timePoints fromURL:(NSURL *)url fileProperties:(NSDictionary *)fileProperties frameProperties:(NSDictionary *)frameProperties frameCount:(int)frameCount gifSize:(GIFSize)gifSize{
     
+    
+    
     NSString *temporaryFile = [NSTemporaryDirectory() stringByAppendingString:fileName];
     NSURL *fileURL = [NSURL fileURLWithPath:temporaryFile];
+    
     CGImageDestinationRef destination = CGImageDestinationCreateWithURL((__bridge CFURLRef)fileURL, kUTTypeGIF , frameCount, NULL);
     
-    if (fileURL == nil)
+    if (fileURL == nil){
+        CFRelease(destination);
         return nil;
-
+    }
+    
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
     AVAssetImageGenerator *generator = [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
     generator.appliesPreferredTrackTransform = YES;
@@ -146,33 +165,46 @@ typedef NS_ENUM(NSInteger, GIFSize) {
     generator.requestedTimeToleranceBefore = tol;
     generator.requestedTimeToleranceAfter = tol;
     
+    CGImageRef imageRef = nil;
+    
     NSError *error = nil;
     for (NSValue *time in timePoints) {
-        CGImageRef imageRef;
-        
-        #if TARGET_OS_IPHONE || TARGET_IPHONE_SIMULATOR
-            imageRef = (float)gifSize/10 != 1 ? ImageWithScale([generator copyCGImageAtTime:[time CMTimeValue] actualTime:nil error:&error], (float)gifSize/10) : [generator copyCGImageAtTime:[time CMTimeValue] actualTime:nil error:&error];
-        #elif TARGET_OS_MAC
+        if((float)gifSize/10 != 1){ // unless GIFSizeOriginal
+            CGImageRef frameimage = [generator copyCGImageAtTime:[time CMTimeValue] actualTime:nil error:&error];
+            if (error) {
+                NSLog(@"Error copying image: %@", error);
+                CFRelease(destination);
+                CGImageRelease(imageRef);
+                CGImageRelease(frameimage);
+                return nil;
+            }
+            // use resized image
+            imageRef = ImageWithScale(frameimage, (float)gifSize/10);
+            CGImageRelease(frameimage);
+            
+        } else {
+            // copy original image frame at time
             imageRef = [generator copyCGImageAtTime:[time CMTimeValue] actualTime:nil error:&error];
-        #endif
-        
+        }
         if (error) {
             NSLog(@"Error copying image: %@", error);
+            CFRelease(destination);
+            CGImageRelease(imageRef);
             return nil;
         }
-        
         CGImageDestinationAddImage(destination, imageRef, (CFDictionaryRef)frameProperties);
         CGImageRelease(imageRef);
+        imageRef = nil;
     }
     
     CGImageDestinationSetProperties(destination, (CFDictionaryRef)fileProperties);
     // Finalize the GIF
     if (!CGImageDestinationFinalize(destination)) {
         NSLog(@"Failed to finalize GIF destination: %@", error);
+        CFRelease(destination);
         return nil;
     }
     CFRelease(destination);
-    
     return fileURL;
 }
 
@@ -180,7 +212,7 @@ typedef NS_ENUM(NSInteger, GIFSize) {
 
 CGImageRef ImageWithScale(CGImageRef imageRef, float scale) {
     
-    #if TARGET_OS_IPHONE || TARGET_IPHONE_SIMULATOR
+    
     CGSize newSize = CGSizeMake(CGImageGetWidth(imageRef)*scale, CGImageGetHeight(imageRef)*scale);
     CGRect newRect = CGRectIntegral(CGRectMake(0, 0, newSize.width, newSize.height));
     
@@ -199,7 +231,6 @@ CGImageRef ImageWithScale(CGImageRef imageRef, float scale) {
     imageRef = CGBitmapContextCreateImage(context);
     
     UIGraphicsEndImageContext();
-    #endif
     
     return imageRef;
 }
@@ -208,16 +239,16 @@ CGImageRef ImageWithScale(CGImageRef imageRef, float scale) {
 
 + (NSDictionary *)filePropertiesWithLoopCount:(int)loopCount {
     return @{(NSString *)kCGImagePropertyGIFDictionary:
-                @{(NSString *)kCGImagePropertyGIFLoopCount: @(loopCount)}
+                 @{(NSString *)kCGImagePropertyGIFLoopCount: @(loopCount)}
              };
 }
 
 + (NSDictionary *)framePropertiesWithDelayTime:(int)delayTime {
-
+    
     return @{(NSString *)kCGImagePropertyGIFDictionary:
-                @{(NSString *)kCGImagePropertyGIFDelayTime: @(delayTime)},
-                (NSString *)kCGImagePropertyColorModel:(NSString *)kCGImagePropertyColorModelRGB
-            };
+                 @{(NSString *)kCGImagePropertyGIFDelayTime: @(delayTime)},
+             (NSString *)kCGImagePropertyColorModel:(NSString *)kCGImagePropertyColorModelRGB
+             };
 }
 
 @end
